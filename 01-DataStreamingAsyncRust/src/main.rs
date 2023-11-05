@@ -3,6 +3,8 @@ use clap::Parser;
 use std::io::{Error, ErrorKind};
 use yahoo::YahooError;
 use yahoo_finance_api as yahoo;
+use async_std::{prelude::*, task};
+use async_trait::async_trait;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -99,7 +101,7 @@ fn min(series: &[f64]) -> Option<f64> {
 ///
 /// Retrieve data from a data source and extract the closing prices. Errors during download are mapped onto io::Errors as InvalidData.
 ///
-fn fetch_closing_data(
+async fn fetch_closing_data(
     symbol: &str,
     beginning: &DateTime<Utc>,
     end: &DateTime<Utc>,
@@ -108,19 +110,53 @@ fn fetch_closing_data(
 
     let response = provider
         .get_quote_history(symbol, *beginning, *end)
+        .await
         .map_err(|qhist_err: YahooError| {
             println!("[ERROR]: Got Quote History Error: {}", qhist_err);
             Error::from(ErrorKind::InvalidData)
         })?;
+
     let mut quotes = response.quotes().map_err(|quotes_err| {
         println!("[ERROR]: Got Quotes Retrieval Error: {}", quotes_err);
         Error::from(ErrorKind::InvalidData)
     })?;
+
     if !quotes.is_empty() {
         quotes.sort_by_cached_key(|k| k.timestamp);
         Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
     } else {
         Ok(vec![])
+    }
+}
+
+async fn process_yahoo_info(opts: Opts, from: DateTime<Utc>, to: DateTime<Utc>) {
+    for symbol in opts.symbols.split(',') {
+            let closes = fetch_closing_data(&symbol, &from, &to)
+                .await;
+
+            match closes {
+                Err(fetch_err) => println!("[ERROR] Error on fetching closing data: {}", fetch_err),
+                Ok(closes_ok) => {
+                    // min/max of the period. unwrap() because those are Option types
+                    let period_max: f64 = max(&closes_ok).unwrap();
+                    let period_min: f64 = min(&closes_ok).unwrap();
+                    let last_price = *closes_ok.last().unwrap_or(&0.0);
+                    let (_, pct_change) = price_diff(&closes_ok).unwrap_or((0.0, 0.0));
+                    let sma = n_window_sma(30, &closes_ok).unwrap_or_default();
+
+                    // a simple way to output CSV data
+                    println!(
+                        "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                        from.to_rfc3339(),
+                        symbol,
+                        last_price,
+                        pct_change * 100.0,
+                        period_min,
+                        period_max,
+                        sma.last().unwrap_or(&0.0)
+                    );
+                }
+            }
     }
 }
 
@@ -135,29 +171,9 @@ fn main() -> std::io::Result<()> {
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to)?;
-        if !closes.is_empty() {
-            // min/max of the period. unwrap() because those are Option types
-            let period_max: f64 = max(&closes).unwrap();
-            let period_min: f64 = min(&closes).unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = price_diff(&closes).unwrap_or((0.0, 0.0));
-            let sma = n_window_sma(30, &closes).unwrap_or_default();
 
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
-    }
+    let yahoo_info_task = task::spawn(process_yahoo_info(opts, from ,to));
+    task::block_on(yahoo_info_task);
     Ok(())
 }
 
@@ -179,7 +195,7 @@ struct MinPrice {}
 impl AsyncStockSignal for MinPrice {
     type SignalType = f64;
     fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-       min(&series) 
+        min(&series)
     }
 }
 
