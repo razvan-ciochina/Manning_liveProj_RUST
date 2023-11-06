@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
 use std::io::{Error, ErrorKind};
-use yahoo::YahooError;
 use yahoo_finance_api as yahoo;
+use yahoo::{YResponse,YahooError, Quote};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -106,61 +106,61 @@ async fn fetch_closing_data(
     symbol: &str,
     beginning: &DateTime<Utc>,
     end: &DateTime<Utc>,
-) -> std::io::Result<Vec<f64>> {
+) -> Result<YResponse, YahooError> {
     let provider = yahoo::YahooConnector::new();
 
     let response = provider
         .get_quote_history(symbol, *beginning, *end)
-        .await
-        .map_err(|qhist_err: YahooError| {
-            println!("[ERROR]: Got Quote History Error: {}", qhist_err);
-            Error::from(ErrorKind::InvalidData)
-        })?;
-
-    let mut quotes = response.quotes().map_err(|quotes_err| {
-        println!("[ERROR]: Got Quotes Retrieval Error: {}", quotes_err);
-        Error::from(ErrorKind::InvalidData)
-    })?;
-
-    if !quotes.is_empty() {
-        quotes.sort_by_cached_key(|k| k.timestamp);
-        Ok(quotes.iter().map(|q| q.adjclose as f64).collect())
-    } else {
-        Ok(vec![])
-    }
+        .await;
+    response
 }
 
-async fn process_yahoo_info(opts: Opts, from: DateTime<Utc>, to: DateTime<Utc>) {
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await;
+async fn process_yahoo_info(opts: String, from: DateTime<Utc>, to: DateTime<Utc>) {
+    let mut closes_future_vec = vec![]; 
+    for symbol in opts.split(',') {
+        let fresult = fetch_closing_data(&symbol, &from, &to).await;
+        closes_future_vec.push((fresult, symbol));
+    }
 
-        match closes {
+    for closes_future in &closes_future_vec {
+        match &closes_future.0 {
             Ok(closes_ok) => {
                 // The Whole puprose of Futures is to initiate then and ask for their result
                 // ONLY when it's needed, so all the awaits are in the println at the end
+                let mut quotes: Vec<Quote> = closes_ok.quotes().map_err(|quotes_err| {
+                    println!("[ERROR]: Got Quotes Retrieval Error on stock symbol {}: {}", &closes_future.1, quotes_err);
+                    Error::from(ErrorKind::InvalidData)
+                }).unwrap_or_default();
 
+                if !quotes.is_empty() {
+                    quotes.sort_by_cached_key(|k| k.timestamp);
+                } else {
+                    continue;
+                }
+
+                let sorted_quotes_as_vec_f64: Vec<f64> = quotes.iter().map(|q| q.adjclose as f64).collect();
                 // min/max of the period. unwrap() because those are Option types
                 let pmax_async = MaxPrice {};
                 let pmin_async = MinPrice {};
-                let period_max = pmax_async.calculate(&closes_ok);
-                let period_min = pmin_async.calculate(&closes_ok);
-                let last_price = *closes_ok.last().unwrap_or(&0.0);
+                let period_max = pmax_async.calculate(&sorted_quotes_as_vec_f64);
+                let period_min = pmin_async.calculate(&sorted_quotes_as_vec_f64);
+                let last_price = *sorted_quotes_as_vec_f64.last().unwrap_or(&0.0);
 
                 // Price Difference Async
                 let pdiff_async = PriceDifference {};
                 let (_, pct_change) = pdiff_async
-                    .calculate(&closes_ok)
+                    .calculate(&sorted_quotes_as_vec_f64)
                     .await
                     .unwrap_or((0.0, 0.0));
 
                 // SMA Async
                 let sma_async = WindowedSMA { window_size: 30 };
-                let sma = sma_async.calculate(&closes_ok);
+                let sma = sma_async.calculate(&sorted_quotes_as_vec_f64);
                 // a simple way to output CSV data
                 println!(
                     "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
                     from.to_rfc3339(),
-                    symbol,
+                    closes_future.1,
                     last_price,
                     pct_change * 100.0,
                     period_min.await.unwrap(),
@@ -168,7 +168,7 @@ async fn process_yahoo_info(opts: Opts, from: DateTime<Utc>, to: DateTime<Utc>) 
                     sma.await.unwrap_or_default().last().unwrap_or(&0.0)
                 );
             }
-            Err(fetch_err) => println!("[ERROR] Error on fetching closing data: {}", fetch_err),
+            Err(fetch_err) => println!("[ERROR] Error on fetching closing data for stock ticker {}: {}", closes_future.1, fetch_err),
         }
     }
 }
@@ -182,11 +182,18 @@ fn main() -> std::io::Result<()> {
         Err(_) => Utc::now(),
     };
 
-    // a simple way to output a CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
+    let ticker_symbols = opts.symbols;
+    for _ in 0..3 {
+        let from_date = from.clone();
+        let to_date = to.clone();
+        let future_symbols = ticker_symbols.clone();
 
-    let yahoo_info_task = task::spawn(process_yahoo_info(opts, from, to));
-    task::block_on(yahoo_info_task);
+        // a simple way to output a CSV header
+        println!("period start,symbol,price,change %,min,max,30d avg");
+
+        let yahoo_info_task = task::spawn(process_yahoo_info(future_symbols, from_date, to_date));
+        task::block_on(yahoo_info_task);
+    }
     Ok(())
 }
 
@@ -268,20 +275,20 @@ mod tests {
 
     #[async_std::test]
     async fn test_MinPrice_calculate() {
-            let signal = MinPrice {};
-            assert_eq!(signal.calculate(&[]).await, None);
-            assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
-            assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
-            assert_eq!(
-                signal
-                    .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                    .await,
-                Some(1.0)
-            );
-            assert_eq!(
-                signal.calculate(&[0.0, 3.0, 5.0, 6.0, 1.0, 2.0, 1.0]).await,
-                Some(0.0)
-            );
+        let signal = MinPrice {};
+        assert_eq!(signal.calculate(&[]).await, None);
+        assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
+        assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
+        assert_eq!(
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            signal.calculate(&[0.0, 3.0, 5.0, 6.0, 1.0, 2.0, 1.0]).await,
+            Some(0.0)
+        );
     }
 
     #[async_std::test]
