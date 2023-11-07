@@ -1,10 +1,13 @@
-use async_std::task;
+#[allow(dead_code)]
+use async_std::{task,stream};
+use async_std::stream::StreamExt;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
 use std::io::{Error, ErrorKind};
+use yahoo::{Quote, YResponse, YahooError};
 use yahoo_finance_api as yahoo;
-use yahoo::{YResponse,YahooError, Quote};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -109,26 +112,17 @@ async fn fetch_closing_data(
 ) -> Result<YResponse, YahooError> {
     let provider = yahoo::YahooConnector::new();
 
-    let response = provider
-        .get_quote_history(symbol, *beginning, *end)
-        .await;
+    let response = provider.get_quote_history(symbol, *beginning, *end).await;
     response
 }
 
-async fn process_yahoo_info(opts: String, from: DateTime<Utc>, to: DateTime<Utc>) {
-    let mut closes_future_vec = vec![]; 
-    for symbol in opts.split(',') {
-        let fresult = fetch_closing_data(&symbol, &from, &to).await;
-        closes_future_vec.push((fresult, symbol));
-    }
 
-    for closes_future in &closes_future_vec {
-        match &closes_future.0 {
+async fn process_yahoo_info(opts: &String, from: DateTime<Utc>, to: DateTime<Utc>) {
+    for symbol in opts.split(',') {
+        match fetch_closing_data(&symbol, &from, &to).await {
             Ok(closes_ok) => {
-                // The Whole puprose of Futures is to initiate then and ask for their result
-                // ONLY when it's needed, so all the awaits are in the println at the end
                 let mut quotes: Vec<Quote> = closes_ok.quotes().map_err(|quotes_err| {
-                    println!("[ERROR]: Got Quotes Retrieval Error on stock symbol {}: {}", &closes_future.1, quotes_err);
+                    println!("[ERROR]: Got Quotes Retrieval Error on stock symbol {}: {}", &symbol, quotes_err);
                     Error::from(ErrorKind::InvalidData)
                 }).unwrap_or_default();
 
@@ -160,18 +154,19 @@ async fn process_yahoo_info(opts: String, from: DateTime<Utc>, to: DateTime<Utc>
                 println!(
                     "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
                     from.to_rfc3339(),
-                    closes_future.1,
+                    &symbol,
                     last_price,
                     pct_change * 100.0,
                     period_min.await.unwrap(),
                     period_max.await.unwrap(),
                     sma.await.unwrap_or_default().last().unwrap_or(&0.0)
                 );
-            }
-            Err(fetch_err) => println!("[ERROR] Error on fetching closing data for stock ticker {}: {}", closes_future.1, fetch_err),
+            },
+            Err(fetch_err) => println!("[ERROR] Error on fetching closing data for stock ticker {}: {}", fetch_err, symbol),
         }
     }
 }
+
 
 fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
@@ -183,17 +178,20 @@ fn main() -> std::io::Result<()> {
     };
 
     let ticker_symbols = opts.symbols;
-    for _ in 0..3 {
-        let from_date = from.clone();
-        let to_date = to.clone();
-        let future_symbols = ticker_symbols.clone();
+    let from_date = from.clone();
+    let to_date = to.clone();
+    let future_symbols = ticker_symbols.clone();
 
-        // a simple way to output a CSV header
-        println!("period start,symbol,price,change %,min,max,30d avg");
+    let mut timeout = stream::interval(Duration::from_secs(30));
+    let yahoo_info_task = task::spawn( async move {
+        process_yahoo_info(&future_symbols, from_date, to_date).await;
+        while let Some(_) = timeout.next().await {
+            println!("period start,symbol,price,change %,min,max,30d avg");
+            process_yahoo_info(&future_symbols, from_date, to_date).await;
+        }
+    });
 
-        let yahoo_info_task = task::spawn(process_yahoo_info(future_symbols, from_date, to_date));
-        task::block_on(yahoo_info_task);
-    }
+    task::block_on(yahoo_info_task);
     Ok(())
 }
 
